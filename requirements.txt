@@ -2,3 +2,4 @@ pyyaml
 python-dotenv
 openai
 requests
+psutil

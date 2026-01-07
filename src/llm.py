@@ -1,6 +1,8 @@
 import json
 import os
 import logging
+import re
+import requests
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 
@@ -10,6 +12,7 @@ except ImportError:
     OpenAI = None
 
 from .config import VALID_TYPES, VALID_CONTEXTS, CONFIDENCE_THRESHOLD, LLM_MODEL
+from . import auth
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +23,13 @@ class LLMInterface(ABC):
 
     @abstractmethod
     def extract_par(self, content: str, file_path: str) -> Dict[str, Any]:
+        pass
+
+    @abstractmethod
+    def generate_content(self, system_prompt: str, user_prompt: str) -> str:
+        """
+        Generic content generation.
+        """
         pass
 
 class MockLLM(LLMInterface):
@@ -75,11 +85,14 @@ class MockLLM(LLMInterface):
             "result": ""
         }
 
-class ProductionLLM(LLMInterface):
+    def generate_content(self, system_prompt: str, user_prompt: str) -> str:
+        return "Mock content generated. This is a placeholder for testing."
+
+class GroqLLM(LLMInterface):
     """
-    Production LLM using OpenAI-compatible API (OpenRouter).
+    Groq LLM using OpenAI-compatible API.
     """
-    def __init__(self, api_key: str, base_url: str = "https://openrouter.ai/api/v1"):
+    def __init__(self, api_key: str, base_url: str = "https://api.groq.com/openai/v1"):
         if not OpenAI:
             raise ImportError("openai package not installed. Run: pip install openai")
         
@@ -131,10 +144,10 @@ class ProductionLLM(LLMInterface):
             except Exception as e:
                 logger.error(f"LLM Call Failed: {e}")
                 logger.error(f"Failed Prompt Context: {user_prompt[:200]}...") # Show snippet
-                return "{}"
+                # Don't return empty, let loop continue to retry
         
         logger.error("Max retries exceeded for LLM call.")
-        return "{}"
+        raise RuntimeError("Groq LLM Failed")
 
     def classify_note(self, content: str, file_path: str) -> Dict[str, Any]:
         system_prompt = f"""
@@ -184,20 +197,86 @@ class ProductionLLM(LLMInterface):
             logger.error(f"Failed to parse PAR JSON: {response_text}")
             return {"problem": "", "action": "", "result": ""}
 
+    def generate_content(self, system_prompt: str, user_prompt: str) -> str:
+        return self._call_llm(system_prompt, user_prompt)
+
+
+
+class LocalLLM(LLMInterface):
+    """
+    Local LLM server (e.g. llama.cpp) using OpenAI-compatible API.
+    """
+    def __init__(self, base_url: str = "http://localhost:8080/v1"):
+        if not OpenAI:
+            raise ImportError("openai package not installed. Run: pip install openai")
+        
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key="sk-no-key-required", 
+        )
+        self.model_name = os.environ.get("LOCAL_LLM_MODEL", "local-model")
+
+    def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
+        import time
+        from openai import APIConnectionError, APITimeoutError
+        
+        max_retries = 3
+        base_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                logger.debug(f"Sending Request [Attempt {attempt+1}]: Local LLM")
+                
+                completion = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    timeout=300
+                )
+                return completion.choices[0].message.content
+                
+            except (APIConnectionError, APITimeoutError) as e:
+                logger.error(f"Local LLM Connection Error: {e}")
+                wait_time = base_delay * (2 ** attempt)
+                time.sleep(wait_time)
+                
+            except Exception as e:
+                logger.error(f"Local LLM Call Failed: {e}")
+                # Don't return empty, let loop continue to retry
+        
+        logger.error("Max retries exceeded for Local LLM call.")
+        raise RuntimeError("Local LLM Failed")
+
+    def classify_note(self, content: str, file_path: str) -> Dict[str, Any]:
+        system_prompt = f"""
+        You are a note classifier. Return JSON only.
+        
+        Possible 'type': {json.dumps(VALID_TYPES)}
+        Possible 'context': {json.dumps(VALID_CONTEXTS)}
+        RULES:
+        1. Extract up to 5 tags.
+        2. Provide confidence (0.0-1.0).
+        3. Use FILE PATH as context.
+        """
+        user_prompt = f"FILE PATH: {file_path}\nCONTENT:\n{content}"
+        
+        response_text = self._call_llm(system_prompt, user_prompt)
+        try:
+            return json.loads(response_text)
+        except json.JSONDecodeError:
+            logger.error(f"Failed to parse Classification JSON: {response_text}")
+            return {}
+
     def extract_par(self, content: str, file_path: str) -> Dict[str, Any]:
         system_prompt = """
         Extract Problem, Action, Result (PAR) as JSON.
         Keys: "problem", "action", "result".
         If missing, use empty string "".
-        Do not shorten significantly. Use FILE PATH for context.
         """
-        
-        user_prompt = f"""
-        FILE PATH: {file_path}
-        
-        CONTENT:
-        {content}
-        """
+        user_prompt = f"FILE PATH: {file_path}\nCONTENT:\n{content}"
         
         response_text = self._call_llm(system_prompt, user_prompt)
         try:
@@ -206,13 +285,16 @@ class ProductionLLM(LLMInterface):
             logger.error(f"Failed to parse PAR JSON: {response_text}")
             return {"problem": "", "action": "", "result": ""}
 
+    def generate_content(self, system_prompt: str, user_prompt: str) -> str:
+        return self._call_llm(system_prompt, user_prompt)
+
+
 class AntigravityLLM(LLMInterface):
     """
     LLM implementation using the reverse-engineered Antigravity API (Google Internal/Sandbox).
     """
     def __init__(self):
         from .auth import get_valid_token
-        import requests
         
         self.endpoint = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:generateContent"
         
@@ -235,10 +317,6 @@ class AntigravityLLM(LLMInterface):
         
         self.mode = mode # Store mode for request time
         
-        # Do NOT append suffix to model name based on user feedback.
-        # "Alias" shouldn't be used to mix Model with Mode.
-        # fast/plan should only control the generationConfig parameters.
-        
         self.model_name = base_model
              
         logger.info(f"Antigravity Config: Model={self.model_name}, Mode={self.mode}")
@@ -249,25 +327,12 @@ class AntigravityLLM(LLMInterface):
             logger.error(f"Authentication failed: {e}")
             raise ImportError(f"Antigravity Auth Failed: {e}")
 
-    def _call_api(self, messages: list) -> str:
-        import requests
-        
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json",
-            "User-Agent": "antigravity/1.11.5 windows/amd64",
-            "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-        }
-        
+    def _call_api(self, messages: list, json_mode: bool = True) -> str:
         # Construct Gemini-style body
-        # Convert OpenAI-style messages to Gemini contents
         contents = []
         for msg in messages:
             role = "user" if msg["role"] == "user" else "model"
             if msg["role"] == "system":
-                # Gemini often handles system prompt differently or just as user/model
-                # We'll prepend to user for simplicity or use system_instruction if supported
-                # For this internal API, let's try standard 'user' for system prompt first
                 role = "user" 
             
             contents.append({
@@ -276,28 +341,21 @@ class AntigravityLLM(LLMInterface):
             })
             
         # Parse model name for API (Strip prefix/suffix)
-        # e.g., models/antigravity-gemini-3-pro-high -> models/gemini-3-pro
         api_model = self.model_name
         thinking_level = None
         
-        # Determine thinking level from Mode
         if self.mode == "plan":
             thinking_level = "high"
         elif self.mode == "fast":
             thinking_level = "low"
             
-        # 1c. Remove 'models/' prefix just in case (API expects just the ID)
         api_model = api_model.replace("models/", "") 
-        # (Assuming Antigravity proxy handles the 'antigravity-' part if present, or we strip it if needed)
         api_model = api_model.replace("antigravity-", "")
             
-        # 3. Handle specific prefixes like 'models/' + proper ID
-        # If it became 'models/gemini-3-flash', that's likely correct.
-        
-        gen_config = {"responseMimeType": "application/json"}
+        gen_config = {}
+        if json_mode:
+            gen_config["responseMimeType"] = "application/json" # Only set if True
         if thinking_level:
-             # Based on opencode-antigravity-auth/src/plugin/transform/gemini.ts:
-             # generationConfig.thinkingConfig = { includeThoughts: true, thinkingLevel: "..." }
              gen_config["thinkingConfig"] = {
                  "includeThoughts": True,
                  "thinkingLevel": thinking_level
@@ -313,55 +371,94 @@ class AntigravityLLM(LLMInterface):
         }
         
         logger.info(f"Antigravity Req: Model={api_model} (Orig: {self.model_name})")
-        try:
-            response = requests.post(self.endpoint, headers=headers, json=payload)
+        
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+             # Headers must be updated inside loop in case token changed
+            headers = {
+                "Authorization": f"Bearer {self.access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "antigravity/1.11.5 windows/amd64",
+                "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+            }
             
-            if response.status_code == 401:
-                # Token might keep expired if script runs long? 
-                # Ideally auth logic handles refresh, but if we catch 401 here we could retry
-                logger.error("Antigravity API 401 Unauthorized. Token might need refresh.")
-                # raise Exception to stop execution
-                raise PermissionError("Antigravity API 401 Unauthorized")
+            try:
+                response = requests.post(self.endpoint, headers=headers, json=payload, timeout=120)
                 
-            if response.status_code != 200:
-                logger.error(f"Antigravity API Error {response.status_code}: {response.text}")
-                return "{}"
-                
-            data = response.json()
-            
-            # Extract candidates (Handle wrapped response)
-            # Some proxies return { response: { candidates: [...] } }
-            candidates = []
-            if 'candidates' in data:
-                candidates = data['candidates']
-            elif 'response' in data and 'candidates' in data['response']:
-                candidates = data['response']['candidates']
-            
-            if candidates:
-                try:
-                    # We concatenate ALL parts, including thoughts.
-                    # Rationale: Sometimes the model puts the final answer inside the thought block,
-                    # or marks the whole response as a thought. _clean_json will extract the code block.
-                    parts = candidates[0]['content']['parts']
-                    final_text = ""
-                    for part in parts:
-                        final_text += part.get('text', "")
+                # Auth Retry Logic
+                if response.status_code == 401:
+                    logger.warning(f"Antigravity API 401 Unauthorized (Attempt {attempt+1}/{max_retries+1}).")
                     
-                    if not final_text:
-                        logger.warning(f"Empty text in response: {data}")
-                        return "{}"
+                    if attempt < max_retries:
+                        logger.info("Attempting automatic token refresh...")
+                        try:
+                            # Reload token from disk/cache
+                            token_data = auth.load_token()
+                            if token_data:
+                                # Force refresh
+                                new_token = auth.refresh_access_token(token_data)
+                                if new_token:
+                                    self.access_token = new_token
+                                    logger.info("Token refreshed successfully. Retrying request...")
+                                    continue
+                        except Exception as e:
+                            logger.error(f"Token refresh failed: {e}")
+                    
+                    # If clean refresh failed or max retries reached:
+                    logger.error("Antigravity API 401 Unauthorized. Token refresh failed or exhausted.")
+                    raise PermissionError("Antigravity API 401 Unauthorized")
+                
+                # Quota Check
+                if response.status_code == 429:
+                    logger.error(f"Antigravity API 429: {response.text}")
+                    if "QUOTA_EXHAUSTED" in response.text or "RESOURCE_EXHAUSTED" in response.text:
+                         logger.error("CRITICAL: API Quota Exhausted. Stopping execution.")
+                         raise BlockingIOError("Antigravity API Quota Exhausted")
+                
+                if response.status_code != 200:
+                    logger.error(f"Antigravity API Error {response.status_code}: {response.text}")
+                    return "{}"
+                    
+                data = response.json()
+                
+                # Extract candidates (Handle wrapped response)
+                candidates = []
+                if 'candidates' in data:
+                    candidates = data['candidates']
+                elif 'response' in data and 'candidates' in data['response']:
+                    candidates = data['response']['candidates']
+                
+                if candidates:
+                    try:
+                        # We concatenate ALL parts, including thoughts.
+                        parts = candidates[0]['content']['parts']
+                        final_text = ""
+                        for part in parts:
+                            final_text += part.get('text', "")
                         
-                    return final_text
-                except (KeyError, IndexError, TypeError):
-                     logger.error(f"Unexpected JSON structure: {data}")
-                     return "{}"
-            else:
-                logger.error(f"No candidates in response: {data}")
+                        if not final_text:
+                            logger.warning(f"Empty text in response: {data}")
+                            return "{}"
+                            
+                        return final_text
+                    except (KeyError, IndexError, TypeError):
+                         logger.error(f"Unexpected JSON structure: {data}")
+                         return "{}"
+                else:
+                    logger.error(f"No candidates in response: {data}")
+                    return "{}"
+
+            except requests.exceptions.Timeout:
+                logger.error("Antigravity API Timeout (120s).")
+                raise TimeoutError("Antigravity API Timeout")
+            except Exception as e:
+                # Re-raise explicit control flow exceptions
+                if isinstance(e, (PermissionError, TimeoutError, BlockingIOError)):
+                    raise e
+                logger.error(f"Antigravity Request Failed: {e}")
                 return "{}"
-            
-        except Exception as e:
-            logger.error(f"Antigravity Request Failed: {e}")
-            return "{}"
+        
+        return "{}"
 
     def _clean_json(self, text: str) -> str:
         """
@@ -375,15 +472,10 @@ class AntigravityLLM(LLMInterface):
             for match in matches:
                 clean_match = match.strip()
                 # Remove common language identifiers if present at the start
-                # e.g. "json\n{...}" -> "{...}"
-                # Handle cases like "json {", "json\n{", or just "{"
-                # Simple heuristic: if it doesn't start with { or [, try stripping the first word
                 if not (clean_match.startswith("{") or clean_match.startswith("[")):
-                    # Split by whitespace to check first word
                     parts = clean_match.split(None, 1)
                     if len(parts) > 1:
                         potential_lang = parts[0].lower()
-                        # If first word looks like a lang tag (json, text, etc) and second part starts with brace
                         if potential_lang in ['json', 'json5', 'text', 'code'] or (parts[1].strip().startswith("{") or parts[1].strip().startswith("[")):
                             clean_match = parts[1].strip()
                 
@@ -455,7 +547,12 @@ class AntigravityLLM(LLMInterface):
             return {}
 
     def extract_par(self, content: str, file_path: str) -> Dict[str, Any]:
-        system_prompt = "Extract PAR (problem, action, result) as JSON. Use FILE PATH for context."
+        system_prompt = """
+        Extract Problem, Action, Result (PAR) as JSON.
+        Keys: "problem", "action", "result".
+        If missing, use empty string "".
+        Do not shorten significantly. Use FILE PATH for context.
+        """
         user_prompt = f"FILE PATH: {file_path}\nCONTENT:\n{content}"
         
         response_text = self._call_api([
@@ -469,34 +566,71 @@ class AntigravityLLM(LLMInterface):
         except json.JSONDecodeError:
             logger.error(f"PAR JSON Parse Failed. Raw: {response_text}")
             return {"problem": "", "action": "", "result": ""}
+            
+    def generate_content(self, system_prompt: str, user_prompt: str) -> str:
+        # Note: _call_api currently defaults to JSON responseFormat. 
+        # This might need adjustment if we want markdown, 
+        # but for now we expect the prompt to handle format instructions or 
+        # we accept the JSON enforcement and just parse inner text if needed.
+        # Actually Antigravity _call_api has "responseMimeType": "application/json" HARDCODED.
+        # We should create a separate call or params to override it.
+        # Ideally, refactor _call_api to accept config. 
+        # For this quick implementation, we'll try to use it as is, 
+        # presuming the model will wrap the text in a JSON field if forced.
+        # OR we modify _call_api to optionally not force JSON.
+        
+        # Let's try sending it and rely on _clean_json if it comes back weird,
+        # OR we just update _call_api now to be flexible (Better).
+        
+        return self._call_api([
+             {"role": "system", "content": system_prompt},
+             {"role": "user", "content": user_prompt}
+        ], json_mode=False)
 
 def get_llm_client() -> LLMInterface:
-    # 1. Check for Configured Model to force Antigravity
-    # If user removed keys or explicitly asks for it?
-    # Actually, let's prioritize Antigravity if keys are missing OR if a flag is present.
-    # User asked to "switch to this".
+    provider = os.environ.get("LLM_PROVIDER", "antigravity").lower()
     
-    # We'll try Antigravity if explicitly requested via Config or Env, 
-    # OR if other keys are missing but we want to try to be smart.
-    # Given the user request "Use this", we should probably default to it if available?
-    # But for safety, let's look for an env var or just try it if others fail?
-    
-    # Let's check for a specific env var "USE_ANTIGRAVITY" or just assumes this is the new default requested.
-    # I will make it the PRIMARY choice for now since that's what the user asked.
-    
-    try:
-        logger.info("Attempting to use Antigravity LLM (Google Internal Auth)...")
-        return AntigravityLLM()
-    except Exception as e:
-        logger.warning(f"Antigravity init failed: {e}")
-    
-    # Fallback to OpenRouter
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if api_key:
-        logger.info(f"Using Production LLM (OpenRouter) with model {os.environ.get('LLM_MODEL', LLM_MODEL)}")
-        return ProductionLLM(api_key)
-    
-    logger.warning("No valid LLM credentials found. Using Mock LLM.")
+    logger.info(f"Initializing LLM Provider: {provider.upper()}")
+
+    # 1. Local
+    if provider == "local":
+        try:
+            from src.config import LOCAL_LLM_URL
+            return LocalLLM(base_url=LOCAL_LLM_URL)
+        except Exception as e:
+            logger.error(f"Failed to init Local LLM: {e}")
+            sys.exit(1)
+            
+    # 2. Groq
+    elif provider == "groq":
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            logger.error("LLM_PROVIDER=groq but GROQ_API_KEY is missing.")
+            sys.exit(1)
+        # Use specific Groq model if set, else config default
+        from src.config import GROQ_LLM_MODEL
+        client = GroqLLM(api_key=api_key)
+        client.model_name = os.environ.get("GROQ_LLM_MODEL", GROQ_LLM_MODEL)
+        return client
+
+    # 3. Antigravity (Default)
+    elif provider == "antigravity":
+        try:
+            logger.info("Attempting to use Antigravity LLM (Google Internal Auth)...")
+            return AntigravityLLM()
+        except Exception as e:
+            logger.warning(f"Antigravity init failed: {e}")
+            # Fallback will be handled by main.py flow (eventually MockLLM here if we strictly follow old logic?)
+            # But here we want to return Mock if it fails init? 
+            # Original code tried Antigravity, then tried OpenRouter/Groq automatically.
+            # Now we have strict selection.
+            # However, for consistency with 'fallback', if Antigravity Init fails (e.g. no auth), 
+            # we might want to let it fail or fallback to Mock.
+            pass
+            
+    # 4. Fallback/Mock
+    # If provider was antigravity but failed, or unknown provider
+    logger.warning(f"Provider '{provider}' failed or not found. Using Mock LLM.")
     return MockLLM()
 
 def validate_classification(data: Dict[str, Any]) -> Dict[str, Any]:

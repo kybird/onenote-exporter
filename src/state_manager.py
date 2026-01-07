@@ -20,6 +20,14 @@ class StateManager:
             return {"processed_files": {}}
 
     def save_state(self):
+        # Check for Dry Run / Skip Update flag
+        if os.environ.get("SKIP_STATE_UPDATE", "false").lower() == "true":
+            # Just print once or rely on the caller? 
+            # Ideally log it, but we don't have logger here effortlessly unless we import it or print.
+            # Printing is fine for this utility.
+            # print("SKIP_STATE_UPDATE=true: Skipping state.json write.")
+            return
+
         # Atomic write for state file
         temp_file = self.state_file.with_suffix('.tmp')
         with open(temp_file, 'w', encoding='utf-8') as f:

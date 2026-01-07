@@ -23,4 +23,7 @@ HIGH_CONFIDENCE_THRESHOLD = 0.9
 # LLM Settings
 # Placeholder for API definitions. 
 # Ideally, this would use environment variables or a secrets manager.
-LLM_MODEL = "google/gemini-2.0-flash-exp:free" 
+LLM_MODEL = "llama-3.3-70b-versatile" 
+GROQ_LLM_MODEL = "llama-3.3-70b-versatile"
+LOCAL_LLM_URL = os.environ.get("LOCAL_LLM_URL", "http://localhost:8080/v1")
+LOCAL_LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "local-model") 

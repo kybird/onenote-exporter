@@ -2,13 +2,17 @@ import os
 import sys
 import shutil
 import logging
+import time
+import json
+import argparse
+import atexit
+import psutil
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
-
 
 # Import components
 from src.config import (
@@ -25,7 +29,7 @@ from src.file_ops import (
     safe_write_file, 
     prepend_frontmatter
 )
-from src.llm import get_llm_client, validate_classification
+from src.llm import get_llm_client, validate_classification, AntigravityLLM, GroqLLM, LocalLLM
 
 # Setup Logging
 logging.basicConfig(
@@ -35,7 +39,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-import argparse
+# --- Singleton Lock Mechanism ---
+LOCK_FILE = Path(".lock")
+
+def cleanup_lock():
+    if LOCK_FILE.exists():
+        try:
+            LOCK_FILE.unlink()
+        except OSError:
+            pass
+
+def acquire_lock():
+    """
+    Ensures single instance using a lock file and PID check.
+    """
+    if LOCK_FILE.exists():
+        try:
+            old_pid = int(LOCK_FILE.read_text().strip())
+            curr_proc = psutil.Process(old_pid)
+            if curr_proc.is_running():
+                print(f"Lock file exists. Process {old_pid} is running. Exiting.")
+                sys.exit(1)
+        except (ValueError, psutil.NoSuchProcess):
+            print("Found stale lock file. Removing...")
+            pass
+            
+    LOCK_FILE.write_text(str(os.getpid()))
+    atexit.register(cleanup_lock)
+# -------------------------------
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Note Classification Pipeline")
@@ -54,7 +85,9 @@ def parse_arguments():
     return parser.parse_args()
 
 def main():
-    import time
+    # Singleton Check
+    acquire_lock()
+    
     args = parse_arguments()
     input_dir = args.input_dir
     delay = args.delay
@@ -94,54 +127,141 @@ def main():
             # 2. Classify (using limited context)
             context_snippet = original_content[:MAX_CONTENT_CHARS]
             
-            # Calculate relative path from the specific input dir
+            # Calculate relative path
             try:
                 rel_path = str(file_path.relative_to(input_dir))
             except ValueError:
-                rel_path = file_name # Fallback if path issues
-                
-            try:
-                classification_raw = llm_client.classify_note(context_snippet, file_path=rel_path)
-            except PermissionError as e:
-                logger.error(f"CRITICAL AUTH FAILURE: {e}")
-                sys.exit(1)
+                rel_path = file_name
+            
+
+
+            # Call CLASSIFY with Fallback Logic
+            classification_raw = {}
+            while True:
+                try:
+                    classification_raw = llm_client.classify_note(context_snippet, file_path=rel_path)
+                    break # Success
+                except BlockingIOError:
+                    logger.warning("Antigravity Quota Exhausted.")
+                    # Fallback Logic: Antigravity -> Groq -> Local
+                    if isinstance(llm_client, AntigravityLLM) and os.environ.get("GROQ_API_KEY"):
+                        logger.info("Switching to GroqLLM (Groq) Fallback...")
+                        try:
+                            from src.config import GROQ_LLM_MODEL as CONFIG_GROQ_MODEL
+                            api_key = os.environ.get("GROQ_API_KEY")
+                            llm_client = GroqLLM(api_key=api_key)
+                            llm_client.model_name = os.environ.get("GROQ_LLM_MODEL", CONFIG_GROQ_MODEL) 
+                            logger.info(f"Fallback Model: {llm_client.model_name}")
+                            continue 
+                        except Exception as ex:
+                            logger.error(f"Groq Init Failed: {ex}")
+                            # Fall through to Local check
+                    
+                    # If Groq not available or failed init, try Local
+                    if not isinstance(llm_client, LocalLLM):
+                         logger.info("Switching to LocalLLM Fallback...")
+                         try:
+                             from src.config import LOCAL_LLM_URL, LOCAL_LLM_MODEL
+                             llm_client = LocalLLM(base_url=LOCAL_LLM_URL)
+                             llm_client.model_name = LOCAL_LLM_MODEL
+                             logger.info(f"Fallback Model: {llm_client.model_name} at {LOCAL_LLM_URL}")
+                             continue
+                         except Exception as ex:
+                             logger.error(f"Local Fallback Failed: {ex}")
+                             sys.exit(1)
+                    else:
+                        logger.error("CRITICAL FAILURE: Quota Exhausted and all Fallbacks failed.")
+                        sys.exit(1)
+
+                except (RuntimeError, PermissionError, TimeoutError) as e:
+                    # Catch RuntimeError from Groq/Local failures
+                    logger.error(f"Provider Error: {e}")
+                    
+                    # Build Fallback Chain here too if not BlockingIOError (e.g. Rate Limit on Groq)
+                    if isinstance(llm_client, GroqLLM):
+                         logger.info("Groq Failed. Switching to LocalLLM Fallback...")
+                         try:
+                             from src.config import LOCAL_LLM_URL, LOCAL_LLM_MODEL
+                             llm_client = LocalLLM(base_url=LOCAL_LLM_URL)
+                             llm_client.model_name = LOCAL_LLM_MODEL
+                             logger.info(f"Fallback Model: {llm_client.model_name} at {LOCAL_LLM_URL}")
+                             continue
+                         except Exception as ex:
+                             logger.error(f"Local Fallback Failed: {ex}")
+                             sys.exit(1)
+                    
+                    logger.error("CRITICAL FAILURE: No more fallbacks.")
+                    sys.exit(1)
             
             classification = validate_classification(classification_raw)
             
             logger.info(f"Classified {file_name} as {classification['type']} (conf: {classification['confidence']})")
             
             # 3. Inject Frontmatter
-            # We construct the metadata from the classification result
             final_content = prepend_frontmatter(original_content, classification)
             
-            # 4. Move to KB (Write to new location, delete old)
-            # Determine destination
+            # 4. Move to KB
             dest_subdir = classification['type']
             dest_path = KB_DIR / dest_subdir / file_name
             
-            # Safe Write to KB
             safe_write_file(dest_path, final_content)
             
-            # Delete from Input (simulating a "Move" with modification)
-            # User Preference: Do NOT delete original files.
-            # try:
-            #     os.remove(file_path)
-            # except OSError as e:
-            #     logger.warning(f"Could not remove source file {file_path}: {e}")
-            #     # If we consider 'read-only' strictly, we might expect this.
-            #     # However, we proceed to PAR extraction regardless.
-            
             # 5. Extract PAR
-            try:
-                par_data = llm_client.extract_par(original_content, file_path=rel_path)
-            except PermissionError as e:
-                logger.error(f"CRITICAL AUTH FAILURE: {e}")
-                sys.exit(1)
+            par_data = {}
+            while True:
+                try:
+                    par_data = llm_client.extract_par(original_content, file_path=rel_path)
+                    break 
+                except BlockingIOError:
+                    logger.warning("Antigravity Quota Exhausted during PAR extraction.")
+                    if isinstance(llm_client, AntigravityLLM) and os.environ.get("GROQ_API_KEY"):
+                        logger.info("Switching to GroqLLM (Groq) Fallback...")
+                        try:
+                            from src.config import GROQ_LLM_MODEL as CONFIG_GROQ_MODEL
+                            api_key = os.environ.get("GROQ_API_KEY")
+                            llm_client = GroqLLM(api_key=api_key)
+                            llm_client.model_name = os.environ.get("GROQ_LLM_MODEL", CONFIG_GROQ_MODEL) 
+                            logger.info(f"Fallback Model: {llm_client.model_name}")
+                            continue
+                        except Exception as ex:
+                             logger.error(f"Groq Init Failed: {ex}")
+                    
+                    if not isinstance(llm_client, LocalLLM):
+                         logger.info("Switching to LocalLLM Fallback...")
+                         try:
+                             from src.config import LOCAL_LLM_URL, LOCAL_LLM_MODEL
+                             llm_client = LocalLLM(base_url=LOCAL_LLM_URL)
+                             llm_client.model_name = LOCAL_LLM_MODEL
+                             logger.info(f"Fallback Model: {llm_client.model_name} at {LOCAL_LLM_URL}")
+                             continue
+                         except Exception as ex:
+                             logger.error(f"Local Fallback Failed: {ex}")
+                             sys.exit(1)
+                    else:
+                        logger.error("CRITICAL FAILURE: All Fallbacks failed.")
+                        sys.exit(1)
+
+                except (RuntimeError, PermissionError, TimeoutError) as e:
+                    logger.error(f"Provider Error: {e}")
+                    if isinstance(llm_client, GroqLLM):
+                         logger.info("Groq Failed. Switching to LocalLLM Fallback...")
+                         try:
+                             from src.config import LOCAL_LLM_URL, LOCAL_LLM_MODEL
+                             llm_client = LocalLLM(base_url=LOCAL_LLM_URL)
+                             llm_client.model_name = LOCAL_LLM_MODEL
+                             logger.info(f"Fallback Model: {llm_client.model_name} at {LOCAL_LLM_URL}")
+                             continue
+                         except Exception as ex:
+                             logger.error(f"Local Fallback Failed: {ex}")
+                             sys.exit(1)
+                    
+                    logger.error("CRITICAL FAILURE: No more fallbacks.")
+                    sys.exit(1)
             
             # 6. Save PAR
             par_filename = file_path.stem + ".json"
             par_path = PAR_DIR / par_filename
-            import json
+            
             par_json_str = json.dumps(par_data, indent=2, ensure_ascii=False)
             safe_write_file(par_path, par_json_str)
             
@@ -153,15 +273,12 @@ def main():
             )
             count_processed += 1
             
-            # Delay to avoid rate limits
+            # Delay
             if delay > 0:
                 time.sleep(delay)
             
         except Exception as e:
             logger.error(f"Failed to process {file_name}: {e}", exc_info=True)
-            # Ensure we don't crash the whole pipeline, but maybe mark as failed?
-            # State manager doesn't track failures persistently to prevent retry loops yet, 
-            # allowing standard retry on next run.
             continue
 
     logger.info(f"Pipeline Complete. Processed {count_processed} files.")
