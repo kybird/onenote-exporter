@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Data (Sensitive User Content)
+input_notes/
+kb/
+distilled_par/
+
+# Application State
+state.json
