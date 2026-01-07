@@ -12,3 +12,4 @@ distilled_par/
 
 # Application State
 state.json
+.antigravity_token.json
